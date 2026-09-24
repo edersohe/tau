@@ -175,6 +175,7 @@ from tau_coding.tui.local_backends import (
 )
 from tau_coding.tui.project_trust import ProjectTrustScreen, prompt_project_trust
 from tau_coding.tui.state import TuiState, format_terminal_command_result_block
+from tau_coding.tui.suspend import resolve_editor_command, suspend_to_editor
 from tau_coding.tui.terminal_notification import TerminalNotificationController
 from tau_coding.tui.terminal_title import TerminalTitleController
 from tau_coding.tui.themes import (
@@ -530,6 +531,8 @@ class CompletionActionTarget(Protocol):
 
     def action_toggle_thinking(self) -> None: ...
 
+    def action_suspend_editor(self) -> None: ...
+
     def action_edit_queued_message(self) -> bool: ...
 
     async def action_submit_prompt(self) -> None: ...
@@ -664,6 +667,10 @@ class PromptInput(TextArea):
     def action_toggle_thinking(self) -> None:
         """Toggle app-level thinking-token display."""
         self._completion_target().action_toggle_thinking()
+
+    def action_suspend_editor(self) -> None:
+        """Open the prompt in the external editor (falling back to internal)."""
+        self._completion_target().action_suspend_editor()
 
     def action_clear_prompt(self) -> None:
         """Clear the current prompt."""
@@ -854,6 +861,10 @@ class PromptInput(TextArea):
         elif event.key == keybindings.toggle_thinking:
             event.stop()
             self._completion_target().action_toggle_thinking()
+        elif event.key == keybindings.suspend_editor:
+            event.stop()
+            event.prevent_default()
+            self.action_suspend_editor()
         elif event.key == keybindings.copy_message:
             if self.selected_text:
                 return
@@ -1441,6 +1452,45 @@ class PromptTemplateEditorScreen(ModalScreen[str | None]):
 
     def action_save(self) -> None:
         source = self.query_one("#prompt-template-editor-input", TextArea).text
+        self.dismiss(source)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PromptEditorScreen(ModalScreen[str | None]):
+    """Internal fallback for the prompt-suspend action when ``$EDITOR`` is unset.
+
+    Returns the new text on save (Ctrl+S), ``None`` on cancel (Escape), and
+    the original text unchanged if the user closes without editing. Mirrors
+    ``PromptTemplateEditorScreen`` but is keyed by plain prompt text and does
+    not depend on a template path.
+    """
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "save", "Save", show=False, priority=True),
+    ]
+
+    def __init__(self, initial_text: str) -> None:
+        super().__init__()
+        self.initial_text = initial_text
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-editor"):
+            yield Static("Edit prompt", id="prompt-editor-title")
+            yield Static(
+                "Set $EDITOR to use your external editor; "
+                "Ctrl+S saves - Escape returns without saving",
+                id="prompt-editor-help",
+            )
+            yield TextArea(self.initial_text, id="prompt-editor-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-editor-input", TextArea).focus()
+
+    def action_save(self) -> None:
+        source = self.query_one("#prompt-editor-input", TextArea).text
         self.dismiss(source)
 
     def action_cancel(self) -> None:
@@ -3822,6 +3872,7 @@ class TauTuiApp(App[None]):
     SessionPickerScreen,
     PromptTemplatePickerScreen,
     PromptTemplateEditorScreen,
+    PromptEditorScreen,
     SkillPickerScreen,
     TreePickerScreen,
     ToolsReferenceScreen,
@@ -3832,6 +3883,7 @@ class TauTuiApp(App[None]):
     #session-picker,
     #prompt-template-picker,
     #prompt-template-editor,
+    #prompt-editor,
     #skill-picker,
     #tree-picker,
     #tools-reference {
@@ -3847,6 +3899,7 @@ class TauTuiApp(App[None]):
     #session-picker-title,
     #prompt-template-picker-title,
     #prompt-template-editor-title,
+    #prompt-editor-title,
     #skill-picker-title,
     #tree-picker-title,
     #tools-reference-title {
@@ -3873,7 +3926,8 @@ class TauTuiApp(App[None]):
         text-style: bold;
     }
 
-    #prompt-template-editor {
+    #prompt-template-editor,
+    #prompt-editor {
         height: 80%;
     }
 
@@ -3883,11 +3937,18 @@ class TauTuiApp(App[None]):
         color: $tau-muted-text;
     }
 
-    #prompt-template-editor-input {
+    #prompt-template-editor-input,
+    #prompt-editor-input {
         height: 1fr;
         background: $tau-prompt-background;
         color: $tau-prompt-text;
         border: tall $tau-prompt-border;
+    }
+
+    #prompt-editor-help {
+        height: 1;
+        margin-bottom: 1;
+        color: $tau-muted-text;
     }
 
     #session-picker-list,
@@ -3948,6 +4009,7 @@ class TauTuiApp(App[None]):
     #session-picker-help,
     #prompt-template-picker-help,
     #prompt-template-editor-help,
+    #prompt-editor-help,
     #skill-picker-help,
     #tree-picker-help,
     #tools-reference-help {
@@ -4733,6 +4795,15 @@ class TauTuiApp(App[None]):
         except (OSError, UnicodeDecodeError) as exc:
             self._notify(f"Could not read {item.path}: {exc}", severity="error")
             return
+        # When `$EDITOR` is set the suspend-to-editor path takes over file
+        # editing; the in-TUI `SidebarFileEditor` is the fallback for systems
+        # without a configured editor.
+        if resolve_editor_command() is not None:
+            self.run_worker(
+                self._edit_sidebar_file_via_external_editor(item, source, snapshot),
+                exclusive=False,
+            )
+            return
         self._open_extension_main_view(
             lambda handle, theme: SidebarFileEditor(
                 handle=handle,
@@ -4743,6 +4814,67 @@ class TauTuiApp(App[None]):
                 snapshot=snapshot,
             )
         )
+
+    async def _edit_sidebar_file_via_external_editor(
+        self,
+        item: SidebarFileItem,
+        source: str,
+        snapshot: _SidebarFileSnapshot,
+    ) -> None:
+        """Hand ``item.path`` to ``$EDITOR`` via the shared dispatcher.
+
+        ``$EDITOR`` writes are atomic-applied through the existing snapshot
+        conflict-check (``_atomic_write_sidebar_file``); the internal
+        ``SidebarFileEditor`` is the fallback when the editor command cannot
+        be launched or when no ``$EDITOR`` is configured. Both paths share
+        the same atomic-save semantics.
+        """
+
+        def fallback_factory(handle, theme):  # type: ignore[no-untyped-def]
+            return SidebarFileEditor(
+                handle=handle,
+                path=item.path,
+                label=item.file_label,
+                kind=item.kind,
+                source=source,
+                snapshot=snapshot,
+            )
+
+        def open_internal(on_done):  # type: ignore[no-untyped-def]
+            # SidebarFileEditor owns its own save action (Ctrl+S); the
+            # dispatcher's ``on_done`` callback is intentionally unused here.
+            self._open_extension_main_view(fallback_factory)
+
+        def apply_external(new_text: str) -> None:
+            self.run_worker(
+                self._save_external_sidebar_file(item.path, new_text, snapshot, fallback_factory),
+                exclusive=False,
+            )
+
+        def on_unchanged() -> None:
+            self._notify(f"No changes to {item.path}")
+
+        self._dispatch_editor_suspend(
+            source,
+            open_internal=open_internal,
+            apply_external=apply_external,
+            on_unchanged=on_unchanged,
+        )
+
+    async def _save_external_sidebar_file(
+        self,
+        path: Path,
+        new_text: str,
+        snapshot: _SidebarFileSnapshot,
+        fallback_factory: Callable[..., SidebarFileEditor],
+    ) -> None:
+        try:
+            await asyncio.to_thread(_atomic_write_sidebar_file, path, new_text, snapshot)
+        except Exception as exc:  # noqa: BLE001 - filesystem worker boundary
+            self._notify(f"Could not save {path}: {exc}", severity="error")
+            self._open_extension_main_view(fallback_factory)
+            return
+        self._notify(f"Saved {path}")
 
     def on_click(self, event: events.Click) -> None:
         """Return keyboard focus to the prompt after clicks in the main TUI."""
@@ -6455,9 +6587,16 @@ class TauTuiApp(App[None]):
                 self._notify(f"Could not read /{result.template.name}: {exc}", severity="error")
                 self._open_prompt_template_picker()
                 return
-            self.push_screen(
-                PromptTemplateEditorScreen(result.template, source),
-                callback=lambda edited: self._handle_prompt_template_edit(result.template, edited),
+            self._dispatch_editor_suspend(
+                source,
+                open_internal=lambda on_done: self.push_screen(
+                    PromptTemplateEditorScreen(result.template, source),
+                    callback=lambda edited: on_done(edited),
+                ),
+                apply_external=lambda edited: self._handle_prompt_template_edit(
+                    result.template, edited
+                ),
+                on_unchanged=self._open_prompt_template_picker,
             )
             return
         invocation = f"/{result.template.name}"
@@ -6575,6 +6714,109 @@ class TauTuiApp(App[None]):
             self.state,
             theme=self.tui_settings.resolved_theme,
         )
+
+    def action_suspend_editor(self) -> None:
+        """Suspend the TUI to edit the prompt in ``$EDITOR`` (or the internal modal).
+
+        When ``$EDITOR`` is set, the TUI is suspended so the editor can take
+        the terminal; the prompt text is rewritten with the file's contents
+        after the editor exits. When ``$EDITOR`` is empty, an internal
+        modal ``PromptEditorScreen`` opens instead so the action always has
+        a working affordance.
+        """
+        try:
+            initial_text = self._current_prompt_text()
+        except NoMatches:
+            return
+        self._dispatch_editor_suspend(
+            initial_text,
+            open_internal=lambda on_done: self.run_worker(
+                self._await_internal_prompt_editor(initial_text, on_done),
+                exclusive=False,
+            ),
+            apply_external=self._replace_prompt_text,
+        )
+
+    def _dispatch_editor_suspend(
+        self,
+        initial_text: str,
+        *,
+        open_internal: Callable[[Callable[[str | None], None]], object],
+        apply_external: Callable[[str], object],
+        on_unchanged: Callable[[], object] | None = None,
+    ) -> None:
+        """Run ``$EDITOR`` when set; otherwise mount the internal editor.
+
+        ``open_internal(on_done)`` mounts the in-TUI editor and is expected
+        to call ``on_done(new_text_or_None)`` when the user saves or
+        cancels. ``apply_external(new_text)`` is called with the editor's
+        output when ``$EDITOR`` returns changes. ``on_unchanged`` runs
+        when the external editor returns text equal to ``initial_text``
+        so callers can notify or reopen the picker (the prompt path
+        leaves it as a no-op).
+
+        A missing command (or any other external-editor failure) notifies
+        and falls back to the internal editor so editing is never blocked.
+        """
+        command = resolve_editor_command()
+        if command is None:
+            open_internal(self._wrap_apply_external(apply_external))
+            return
+
+        try:
+            new_text = suspend_to_editor(self.suspend, initial_text)
+        except FileNotFoundError as exc:
+            self._notify(
+                f"$EDITOR command not found: {exc.filename or exc.strerror}",
+                severity="error",
+            )
+            open_internal(self._wrap_apply_external(apply_external))
+            return
+        except Exception as exc:  # noqa: BLE001 - filesystem/process boundary
+            self._notify(f"External editor failed: {exc}", severity="error")
+            return
+
+        if new_text is None or new_text == initial_text:
+            if on_unchanged is not None:
+                on_unchanged()
+            return
+
+        apply_external(new_text)
+
+    @staticmethod
+    def _wrap_apply_external(
+        apply_external: Callable[[str], object],
+    ) -> Callable[[str | None], None]:
+        """Adapt an apply-external callback to the internal editor's cancel-or-save shape."""
+
+        def callback(result: str | None) -> None:
+            if result is not None:
+                apply_external(result)
+
+        return callback
+
+    async def _await_internal_prompt_editor(
+        self, initial_text: str, on_done: Callable[[str | None], None]
+    ) -> None:
+        """Push the internal fallback editor and forward its result to ``on_done``."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str | None] = loop.create_future()
+        screen = PromptEditorScreen(initial_text)
+
+        def _resolve(result: str | None) -> None:
+            if not future.done():
+                future.set_result(result)
+
+        self.push_screen(screen, _resolve)
+        result = await future
+        on_done(result)
+
+    def _replace_prompt_text(self, new_text: str) -> None:
+        """Write ``new_text`` back into the prompt and reset cursor to the end."""
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.text = new_text
+        prompt.move_cursor((new_text.count("\n"), len(new_text.rsplit("\n", 1)[-1])))
+        prompt.focus()
 
     def _handle_session_picker_result(self, session_id: str | None) -> None:
         if session_id is None:

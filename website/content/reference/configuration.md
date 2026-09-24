@@ -432,6 +432,7 @@ The built-in frontend reads optional settings from `~/.tau/tui.json`:
     "toggle_thinking": "ctrl+t",
     "toggle_tool_results": "ctrl+o",
     "copy_message": "ctrl+c",
+    "suspend_editor": "ctrl+e",
     "quit": "ctrl+d"
   }
 }

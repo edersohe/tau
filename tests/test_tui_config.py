@@ -28,6 +28,7 @@ def test_load_tui_settings_returns_defaults_when_file_is_missing(tmp_path: Path)
     assert load_tui_settings(paths) == TuiSettings()
     assert load_tui_settings(paths).keybindings.model_cycle_reverse == "ctrl+shift+p"
     assert load_tui_settings(paths).keybindings.quit == "ctrl+d"
+    assert load_tui_settings(paths).keybindings.suspend_editor == "ctrl+e"
 
 
 def test_load_tui_settings_reads_keybindings(tmp_path: Path) -> None:

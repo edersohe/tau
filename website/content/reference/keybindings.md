@@ -26,6 +26,7 @@ These are the default keys in the interactive [TUI]({{< relref "../guides/tui.md
 | `Ctrl+R` | Open the session picker |
 | `Tab` | Accept any highlighted completion, including `@` file references |
 | `Down` / `Up` | Move through completions |
+| `Ctrl+E` (on the prompt) | Suspend the TUI to edit the prompt in `$EDITOR` (falls back to an internal modal editor when `$EDITOR` is unset) |
 | `Ctrl+E` (in `/prompts`) | Edit the selected prompt template |
 | `Ctrl+S` (while editing a prompt template) | Save and reload resources |
 

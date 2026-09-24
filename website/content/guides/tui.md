@@ -45,6 +45,28 @@ another prompt without starting a new session; empty failed provider turns are
 retained for diagnostics but are not replayed to the model as invalid
 conversation history.
 
+**Ctrl+E** sends the current prompt to your external editor. When `$EDITOR` is
+set, Tau suspends the TUI, hands the terminal to the editor with the prompt as a
+staging file, and rewrites the prompt from the saved contents when the editor
+exits. Quoted arguments are honored (`$EDITOR="code --wait"` works) and the
+staging file is a `.md` so editors that switch behaviour by extension behave
+predictably. When `$EDITOR` is empty, the same key opens an in-TUI modal editor
+so the shortcut is always available even on systems without a configured editor.
+Remap with the `suspend_editor` keybinding in `~/.tau/tui.json`.
+
+The same rule applies to Tau's other built-in editors: `/prompts` template
+editing (`Ctrl+E` in the picker) and clicking a sidebar resource file
+(skill, prompt template, `AGENTS.md`, …) both defer to `$EDITOR` when it is
+set. The in-TUI editors are the fallback when `$EDITOR` is empty; if
+`$EDITOR` is set but the binary cannot be launched, the in-TUI editor opens
+instead so editing is never blocked.
+
+The suspend mechanism itself is general: any component can hand the
+terminal to an external command (editor, full-screen TUI like `lazygit`
+or `jj`, or a shell command) by routing through Tau's `suspend_to_command`
+helper. Future slash commands can build on it the same way `$EDITOR`
+editing does.
+
 ## Cancelling and steering a run
 
 While the agent is working you don't have to wait:

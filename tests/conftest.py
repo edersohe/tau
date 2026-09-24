@@ -21,6 +21,10 @@ def isolate_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Path.home() resolves via USERPROFILE on Windows, so HOME alone does not
     # isolate tests from the developer's real ~/.tau settings.
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # A developer's `$EDITOR` would silently change TUI behavior by handing the
+    # terminal to an external editor; tests must explicitly opt into the
+    # suspend path or assert the internal fallback path.
+    monkeypatch.delenv("EDITOR", raising=False)
 
 
 @pytest.fixture(autouse=True)
